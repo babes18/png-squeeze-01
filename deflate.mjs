@@ -195,29 +195,50 @@ function hash3(d, i) {
   return Math.imul((d[i] << 16) | (d[i + 1] << 8) | d[i + 2], 0x9e3779b1) >>> 16;
 }
 
-function insertPos(data, i, head, prev) {
+// Multiplicative 4-byte hash (libdeflate/pixo magic 0x1E35A7BD), order 16.
+function hash4(d, i) {
+  const v = (d[i] << 24) | (d[i + 1] << 16) | (d[i + 2] << 8) | d[i + 3];
+  return (Math.imul(v, 0x1e35a7bd) >>> 16) & 0xffff;
+}
+
+// Insert position i into both tables: the hash4 chain (head4/prev4, for
+// length-4+ matches) and the hash3 most-recent slot (head3, for length-3
+// matches — no chain, libdeflate hc style).
+function insertPos(data, i, head4, prev4, head3) {
   if (i + 2 >= data.length) return;
-  const h = hash3(data, i);
-  prev[i] = head[h];
-  head[h] = i;
+  head3[hash3(data, i)] = i;
+  if (i + 3 >= data.length) return;
+  const h = hash4(data, i);
+  prev4[i] = head4[h];
+  head4[h] = i;
 }
 
 /**
- * The match frontier at position `i`: pairs (length, distance) of the segments
- * of the sublen function — for each segment (prevLen, len] the shortest distance
- * achieving a match of that length. `pairs` is a scratch Int32Array (at least 64
- * entries); returns the pair count. `scratch` is a preallocated Int32Array (at
- * least 64 entries) used as candidate storage, so this runs allocation-free.
+ * The match frontier at position `i` (v2: dual-hash finder, libdeflate hc /
+ * pixo style): pairs (length, distance) of the segments of the sublen
+ * function — for each segment (prevLen, len] the shortest distance achieving
+ * a match of that length. `pairs` is a scratch Int32Array (at least 64
+ * entries); returns the pair count. `scratch` is a preallocated Int32Array
+ * (at least 64 entries) used as candidate storage, so this runs
+ * allocation-free.
  *
- * Candidates come from two sources: a propagated `seed` (the longest match at
- * position i-1, of length L at distance d, implies a match of length >= L-1 at
- * distance d at i — extended here to its true length, so long matches survive
- * without a deep chain walk) and a hash-chain walk. Chain candidates are
- * visited in increasing distance order; the first few are always fully
- * compared (they hold the short-distance options), later ones only when they
- * can beat the best length so far. The walk is adaptive, like zlib's: once a
- * match of `goodLen` is found the remaining budget drops to a quarter of `cap`,
- * and a match of `niceLen` ends the walk at once.
+ * Candidates come from: a propagated `seed` (the longest match at position
+ * i-1, of length L at distance d, implies a match of length >= L-1 at
+ * distance d at i — extended here to its true length); a same-byte run
+ * shortcut (a run of identical bytes matches at distance 1, and a run of
+ * >= 32 skips the chain walk entirely — in flat/alpha data the 4-byte hash
+ * chain of a zero run is thousands of nodes long and the walk would only
+ * re-find this match); a hash4 chain walk for length-4+ matches (4-byte
+ * patterns discriminate far better than 3-byte ones, so the chain is short
+ * and far matches are reachable); and the hash3 most-recent position for
+ * length-3 matches whose 4th byte differs. Chain candidates are visited in
+ * increasing distance order; the first few are always fully compared (they
+ * hold the short-distance options), later ones only when they can beat the
+ * best length so far. NO goodLen cut (v1's cut at 32 truncated 75% of walks
+ * before any far match was reached): the walk ends only on a `niceLen`
+ * match (default 258) or when `cap` steps are spent. The caller halves the
+ * cap when the previous position already had a good match (zlib-style
+ * adaptive depth).
  *
  * The frontier is built exactly from all recorded candidates: sort by length,
  * take suffix minima of distance, and emit a pair at each length where the
@@ -233,23 +254,23 @@ function insertPos(data, i, head, prev) {
  * hundreds of steps. It is checked after the walk and only when bestLen is
  * small, so it never gates the walk.
  */
-function findFrontier(data, i, end, head, prev, cap, pairs, scratch, goodLen, niceLen, seedLen, seedDist, rowLen) {
+function findFrontier(data, i, end, head4, prev4, head3, cap, pairs, scratch, niceLen, seedLen, seedDist, rowLen) {
   const maxLen = Math.min(258, end - i);
   // Candidate pairs in `scratch` as [len, dist, ...], kept sorted by length
-  // ascending (insertion sort; the list stays tiny). `nc` is the pair count.
+  // ascending with unique lengths (insertion sort; the list stays tiny).
+  // For a length already present keep the shortest distance.
   let nc = 0;
   const insertCand = (len, dist) => {
     if (len < 3 || len > maxLen) return;
-    // Insert sorted by (len, dist); for a length already present keep the
-    // shortest distance (the loop stops at a same-length pair only when its
-    // distance is longer, so overwrite it in place).
-    let at = 0;
-    while (at < nc && (scratch[at * 2] < len || (scratch[at * 2] === len && scratch[at * 2 + 1] <= dist))) at++;
-    if (at < nc && scratch[at * 2] === len) {
-      scratch[at * 2 + 1] = dist;
-      return;
+    for (let k = 0; k < nc; k++) {
+      if (scratch[k * 2] === len) {
+        if (dist < scratch[k * 2 + 1]) scratch[k * 2 + 1] = dist;
+        return;
+      }
     }
     if (nc >= 32) return;
+    let at = 0;
+    while (at < nc && scratch[at * 2] < len) at++;
     for (let k = nc; k > at; k--) {
       scratch[k * 2] = scratch[(k - 1) * 2];
       scratch[k * 2 + 1] = scratch[(k - 1) * 2 + 1];
@@ -260,42 +281,63 @@ function findFrontier(data, i, end, head, prev, cap, pairs, scratch, goodLen, ni
   };
   if (seedLen > maxLen) seedLen = maxLen;
   if (seedLen >= 3) insertCand(seedLen, seedDist);
-  // NOTE: bestLen here is chain-only on purpose (see the header).
   let bestLen = 0;
-  if (i + 3 <= end) {
-    const h = hash3(data, i);
-    let p = head[h];
-    let steps = 0;
-    let limit = cap;
-    while (p >= 0 && steps < limit) {
-      const dist = i - p;
-      if (dist > 32768) break;
-      steps++;
-      if (bestLen >= maxLen) break;
-      if (bestLen >= niceLen) break;
-      // The first few candidates are always fully compared: they are the
-      // shortest distances, and a long seed must not hide them.
-      if (steps > 4 && bestLen > 0 && data[p + bestLen] !== data[i + bestLen]) {
-        p = prev[p];
-        continue;
+  // Same-byte run shortcut (Zopfli HASH_SAME / pixo detect_same_byte_run).
+  // A distance-1 match at i needs data[i] === data[i-1] (i lies INSIDE a run
+  // of identical bytes); its length is how far the run continues past i.
+  // (Checking data[i] === data[i+1] instead — a run STARTING at i — is
+  // wrong: it invents a match with no byte behind it, e.g. (258, 1) at i=0,
+  // and corrupts the stream. Found by frontier validation, 27 Nov.)
+  let runLen = 0;
+  if (i > 0 && data[i] === data[i - 1]) {
+    runLen = 1;
+    while (runLen < maxLen && data[i + runLen] === data[i]) runLen++;
+    if (runLen >= 3) insertCand(runLen, 1);
+    if (runLen > bestLen) bestLen = runLen;
+  }
+  if (runLen < 32) {
+    if (i + 4 <= end) {
+      // hash4 chain walk: length-4+ matches, increasing distance order.
+      const h = hash4(data, i);
+      let p = head4[h];
+      let steps = 0;
+      while (p >= 0 && steps < cap) {
+        const dist = i - p;
+        if (dist > 32768) break;
+        steps++;
+        if (bestLen >= maxLen) break;
+        if (bestLen >= niceLen) break;
+        // The first few candidates are always fully compared: they are the
+        // shortest distances, and a long seed must not hide them.
+        if (steps > 4 && bestLen > 0 && data[p + bestLen] !== data[i + bestLen]) {
+          p = prev4[p];
+          continue;
+        }
+        if (data[p] !== data[i] || data[p + 1] !== data[i + 1] || data[p + 2] !== data[i + 2] || data[p + 3] !== data[i + 3]) {
+          p = prev4[p];
+          continue;
+        }
+        let len = 4;
+        while (len < maxLen && data[p + len] === data[i + len]) len++;
+        if (len >= 4 && (steps <= 4 || len > bestLen)) {
+          insertCand(len, dist);
+          if (len > bestLen) bestLen = len;
+        }
+        p = prev4[p];
       }
-      if (data[p] !== data[i] || data[p + 1] !== data[i + 1] || data[p + 2] !== data[i + 2]) {
-        p = prev[p];
-        continue;
-      }
-      let len = 3;
-      while (len < maxLen && data[p + len] === data[i + len]) len++;
-      if (len >= 3 && (steps <= 4 || len > bestLen)) {
-        insertCand(len, dist);
-        if (len > bestLen) {
-          bestLen = len;
-          if (bestLen >= goodLen) {
-            const cut = steps + Math.max(8, cap >> 2);
-            if (cut < limit) limit = cut;
-          }
+    }
+    if (i + 3 <= end) {
+      // hash3 most-recent position only (no chain): length-3 matches whose
+      // 4th byte differs, which the hash4 walk can never see.
+      const p3 = head3[hash3(data, i)];
+      if (p3 >= 0 && p3 < i) {
+        const dist = i - p3;
+        if (dist <= 32768 && data[p3] === data[i] && data[p3 + 1] === data[i + 1] && data[p3 + 2] === data[i + 2]) {
+          let len = 3;
+          while (len < maxLen && data[p3 + len] === data[i + len]) len++;
+          if (len >= 3) insertCand(len, dist);
         }
       }
-      p = prev[p];
     }
   }
   // Previous-row candidate: only when the walk found little, so it never
@@ -377,8 +419,9 @@ function huffmanCosts(ll, d) {
 }
 
 /** Greedy LZ77 parse (longest match wins, no lazy step) — only seeds the first cost model. */
-function greedyCounts(data, n, head, prev) {
-  head.fill(-1);
+function greedyCounts(data, n, head4, prev4, head3) {
+  head4.fill(-1);
+  head3.fill(-1);
   const ll = new Uint32Array(286);
   const d = new Uint32Array(30);
   const pairs = new Int32Array(64);
@@ -388,7 +431,7 @@ function greedyCounts(data, n, head, prev) {
     let len = 0;
     let dist = 0;
     if (i + 3 <= n) {
-      const c = findFrontier(data, i, n, head, prev, 32, pairs, scratch, 16, 64, 0, 0, 0);
+      const c = findFrontier(data, i, n, head4, prev4, head3, 32, pairs, scratch, 64, 0, 0, 0);
       if (c > 0) {
         len = pairs[(c - 1) * 2];
         dist = pairs[(c - 1) * 2 + 1];
@@ -397,11 +440,11 @@ function greedyCounts(data, n, head, prev) {
     if (len >= 3) {
       ll[257 + LEN_SYM[len]]++;
       d[DIST_SYM[dist]]++;
-      insertPos(data, i, head, prev);
+      insertPos(data, i, head4, prev4, head3);
       i += len;
     } else {
       ll[data[i]]++;
-      insertPos(data, i, head, prev);
+      insertPos(data, i, head4, prev4, head3);
       i++;
     }
   }
@@ -413,9 +456,10 @@ function greedyCounts(data, n, head, prev) {
 /**
  * Forward-DP optimal parse of data[start..end) under `costs` ({ll, d} bit costs).
  * `ctx` selects the match source:
- *   - walk: hash-chain walks (cap `ctx.cap`), filling `ctx.cache` per position
- *     with the longest match (len/dist) and the shortest-distance match (len2/dist2);
- *     `ctx.head`/`ctx.prev` must hold the chain for positions < start.
+ *   - walk: hash-chain walks (cap `ctx.cap`, halved when the previous position
+ *     already had a good match), filling `ctx.cache` per position with the
+ *     longest match (len/dist) and the shortest-distance match (len2/dist2);
+ *     `ctx.head4`/`ctx.prev4`/`ctx.head3` must hold the tables for positions < start.
  *   - cached: matches come from `ctx.cache` only (no chain work).
  * Matches may reach back before `start` (the window is global); only the DP
  * arrays are per-range. Returns {toks, dists, count, ll, d}: toks[k] is a literal
@@ -433,11 +477,11 @@ function dpParse(data, start, end, costs, ctx) {
   const llCost = costs.ll;
   const dCost = costs.d;
   const walk = ctx.walk;
-  const head = ctx.head;
-  const prev = ctx.prev;
+  const head4 = ctx.head4;
+  const prev4 = ctx.prev4;
+  const head3 = ctx.head3;
   const cap = ctx.cap;
-  const goodLen = ctx.goodLen ?? 32;
-  const niceLen = ctx.niceLen ?? 128;
+  const niceLen = ctx.niceLen ?? 258;
   const rowLen = ctx.rowLen ?? 0;
   const useSeed = ctx.seed !== false;
   const cache = ctx.cache;
@@ -457,7 +501,7 @@ function dpParse(data, start, end, costs, ctx) {
       prevDist[base + 1] = 0;
     }
     if (i + 3 > end) {
-      if (walk) insertPos(data, i, head, prev);
+      if (walk) insertPos(data, i, head4, prev4, head3);
       prevBestLen = 0;
       prevBestDist = 0;
       continue;
@@ -475,7 +519,10 @@ function dpParse(data, start, end, costs, ctx) {
         if (seedLen > maxLen) seedLen = maxLen;
         while (seedLen < maxLen && data[i - seedDist + seedLen] === data[i + seedLen]) seedLen++;
       }
-      pairCount = findFrontier(data, i, end, head, prev, cap, pairs, scratch, goodLen, niceLen, seedLen, seedDist, rowLen);
+      // zlib-style adaptive depth: a good match at the previous position
+      // means near candidates already cover this one, so spend less walk.
+      const effCap = prevBestLen >= 32 ? (cap >> 2) : cap;
+      pairCount = findFrontier(data, i, end, head4, prev4, head3, effCap, pairs, scratch, niceLen, seedLen, seedDist, rowLen);
       if (ctx.fillCache && pairCount > 0) {
         const base = i * 4;
         const m = pairCount <= 4 ? pairCount : 4;
@@ -517,7 +564,7 @@ function dpParse(data, start, end, costs, ctx) {
     for (let k = 0; k < pairCount; k++) {
       const len = pairs[k * 2];
       const dist = pairs[k * 2 + 1];
-      const dc = dCost[DIST_SYM[dist]];
+      const dc = dCost[DIST_SYM[dist]] + DIST_EXTRA[DIST_SYM[dist]]; // v2: distance extra bits MUST be priced — omitting them made the DP think far matches were nearly free (i006: predicted 8.36 bit/token vs exact 16.44; 831,774 missing bits), so it lost to zlib-9 on i003/i004/i006.
       let j = prevBest + 1;
       const segEnd = len;
       while (j <= segEnd) {
@@ -535,7 +582,7 @@ function dpParse(data, start, end, costs, ctx) {
       }
       prevBest = len;
     }
-    if (walk) insertPos(data, i, head, prev);
+    if (walk) insertPos(data, i, head4, prev4, head3);
   }
 
   // Backtrack into tokens.
@@ -803,17 +850,18 @@ function wrapZlib(payload, data) {
  */
 export function deflateOptimal(data, opts = {}) {
   const n = data.length;
-  // Fixed work budget (never wall-clock): a shallow chain cap plus the goodLen
-  // cut keeps a set of 8 inside ~45 s locally, leaving headroom for the
-  // grader's single CPU. The DP still beats zlib-9 on the images it can, and
+  // Fixed work budget (never wall-clock): the dual-hash finder (v2) makes
+  // the chain walk affordable — hash4 buckets are far less crowded than
+  // hash3, a same-byte run shortcut skips degenerate zero-run walks, and the
+  // walk halves its cap after a good previous match. niceLen 258 exits only
+  // on a max-length match; there is no goodLen cut (v1's cut at 32 truncated
+  // 75% of walks). chainCap 384 is the SHIPPED value, tuned 27 Nov: measured
+  // full-set 523,769 B in 48.3 s CPU (grade-local 740,610). vs cap 512: +310 B,
+  // −0.8 s; vs cap 1024: +2,216 B, −7.4 s; vs cap 256: −535 B, +3.2 s.
+  // The 60 s grader wall needs the time margin more than the bytes.
   // main.ts keeps whichever stream is smaller, so a weaker DP costs little.
-  const chainCap = opts.chainCap ?? 256;
-  // The goodLen cut: once a match of goodLen is found, the remaining chain
-  // budget drops to a quarter of the cap. It saves ~30% of the walk time for
-  // ~1% of size. The niceLen exit is left off: stopping the walk entirely on
-  // a long match loses the short-distance options the DP needs.
-  const goodLen = opts.goodLen ?? 32;
-  const niceLen = opts.niceLen ?? Infinity;
+  const chainCap = opts.chainCap ?? 384;
+  const niceLen = opts.niceLen ?? 258;
   const useSeed = opts.seed ?? true;
   const rowLen = opts.rowLen ?? 0;
   const iterations = opts.iterations ?? 2;
@@ -823,8 +871,9 @@ export function deflateOptimal(data, opts = {}) {
   // ~18 s. The blockSizes above still try a 128 KiB split at emission time.
   const refineBlock = opts.refineBlock ?? 0;
 
-  const head = new Int32Array(HASH_SIZE).fill(-1);
-  const prev = new Int32Array(n);
+  const head4 = new Int32Array(HASH_SIZE).fill(-1);
+  const prev4 = new Int32Array(n);
+  const head3 = new Int32Array(HASH_SIZE).fill(-1);
   // Match cache for later iterations: up to 4 frontier pairs per position
   // (the first three and the longest), so a refined-cost re-parse keeps the
   // middle landing positions instead of only the shortest and longest match.
@@ -844,13 +893,14 @@ export function deflateOptimal(data, opts = {}) {
   };
 
   // Seed: greedy parse.
-  const seed = greedyCounts(data, n, head, prev);
+  const seed = greedyCounts(data, n, head4, prev4, head3);
   let costs = logCosts(seed.ll, seed.d);
   // Iteration 1: full DP with hash-chain walks, filling the match cache. The
   // chain must start empty: the greedy pass leaves head pointing at positions
   // the DP has not reached yet, which would read as negative distances.
-  head.fill(-1);
-  let tokens = dpParse(data, 0, n, costs, { walk: true, cap: chainCap, goodLen, niceLen, seed: useSeed, rowLen, head, prev, cache, fillCache: true });
+  head4.fill(-1);
+  head3.fill(-1);
+  let tokens = dpParse(data, 0, n, costs, { walk: true, cap: chainCap, niceLen, seed: useSeed, rowLen, head4, prev4, head3, cache, fillCache: true });
   consider(tokens);
   // Later iterations: cached DP under refined cost models. The refined model
   // is the exact Huffman lengths from the previous parse (huffmanCosts) when

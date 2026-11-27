@@ -116,6 +116,7 @@ function paletteOrder(colours, order) {
   const opaque = colours.filter((c) => c.rgba[3] === 255);
   if (order === 'luminance') opaque.sort((x, y) => lum(x) - lum(y) || x.word - y.word);
   else if (order === 'walk') {
+    if (opaque.length <= 1) return [...transparent, ...opaque]; // v2 fix: with no opaque colours the walk below pushes opaque[0] === undefined and paletteForm crashes (all-transparent image).
     opaque.sort((x, y) => y.count - x.count || x.word - y.word);
     // Greedy nearest-neighbour walk over the opaque colours.
     const used = new Uint8Array(opaque.length);
