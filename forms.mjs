@@ -1,0 +1,300 @@
+// Forms and filters for png-squeeze-01. Adapted from make.fun's own scale.mjs (MIT,
+// program/generator/subject/scale.mjs in the kit): analyse(), transparentKey(),
+// samplesOf(), paletteForm(), filtered() and the screen follow the kit's logic, with
+// two additions of our own: a third palette ordering (nearest-neighbour walk through
+// colour space, which keeps neighbouring indices close and filters better on flat
+// images) and screenAll(), which returns every screened candidate ranked by its
+// zlib-6 size so the caller can run the optimal deflate on the best one or two.
+//
+// The choices that hold the image exactly:
+//   - a palette (type 3, transparent entries first so tRNS is short) when the image
+//     has at most 256 colours, its other entries by count, by luminance, or by a
+//     nearest-neighbour walk; grey (type 0) or grey and alpha (type 4) when every
+//     pixel is grey; RGB (type 2) or RGBA (type 6) otherwise; with one fully
+//     transparent value that no opaque pixel uses and every other pixel opaque,
+//     type 0 or 2 with a tRNS key instead of an alpha channel;
+//   - the filters: every row unfiltered, or every row one fixed filter, or each row
+//     its own: the minimum-sum heuristic (PNG spec section 12.8) or the fewest
+//     distinct byte pairs. Brute force (a zlib run per row per filter) is NOT
+//     tried: the coordinator measured it at ~0.5% overall for ~8 s a set, and the
+//     optimal deflate below is worth far more per second.
+
+import { constants, deflateSync } from 'node:zlib';
+import { filterRow, ihdrOf, pngOf, signedSum } from './png.mjs';
+
+/** How many bytes written before a row brute force compresses its trials after. */
+const BRUTE_CONTEXT = 32768;
+/** The zlib level brute force weighs a row's trials at. */
+const BRUTE_LEVEL = 4;
+
+/** The image's pixels as 32-bit words (a copy when its bytes do not start on a word boundary). */
+function wordsOf(rgba) {
+  const at = rgba.byteOffset % 4 === 0 ? rgba : rgba.slice();
+  return new Uint32Array(at.buffer, at.byteOffset, at.length >>> 2);
+}
+
+/** What the image holds: whether every pixel is opaque, whether every pixel is grey, and its colours when at most 256. */
+export function analyse(rgba) {
+  const n = rgba.length >>> 2;
+  const u32 = wordsOf(rgba);
+  let opaque = true;
+  let grey = true;
+  const counts = new Map();
+  let many = false;
+  for (let i = 0, d = 0; i < n; i++, d += 4) {
+    if (rgba[d + 3] !== 255) opaque = false;
+    if (rgba[d] !== rgba[d + 1] || rgba[d] !== rgba[d + 2]) grey = false;
+    if (!many) {
+      const c = u32[i];
+      const k = counts.get(c);
+      if (k === undefined) {
+        if (counts.size === 256) many = true;
+        else counts.set(c, 1);
+      } else counts.set(c, k + 1);
+    }
+  }
+  // A colour as [r, g, b, a] whatever the platform's byte order: read back from the bytes, never from the word.
+  const colours = many ? null : [...counts.keys()].map((c) => {
+    const b = new Uint8Array(Uint32Array.of(c).buffer);
+    return { rgba: [b[0], b[1], b[2], b[3]], word: c, count: counts.get(c) };
+  });
+  return { opaque, grey, colours };
+}
+
+/**
+ * The one fully transparent value (grey or RGB) the image may key by tRNS instead of an alpha channel: every pixel
+ * opaque or that exact value at alpha 0, and no opaque pixel of the same value. Null when there is none.
+ */
+export function transparentKey(rgba, grey) {
+  let key = -1;
+  for (let d = 0; d < rgba.length; d += 4) {
+    const a = rgba[d + 3];
+    if (a === 255) continue;
+    if (a !== 0) return null;
+    const v = grey ? rgba[d] : (rgba[d] << 16) | (rgba[d + 1] << 8) | rgba[d + 2];
+    if (key === -1) key = v;
+    else if (key !== v) return null;
+  }
+  if (key === -1) return null;
+  for (let d = 0; d < rgba.length; d += 4) {
+    if (rgba[d + 3] !== 255) continue;
+    const v = grey ? rgba[d] : (rgba[d] << 16) | (rgba[d + 1] << 8) | rgba[d + 2];
+    if (v === key) return null;
+  }
+  return key;
+}
+
+/** The image's samples in colour type `ct` (0, 2, 4 or 6) from its RGBA. */
+export function samplesOf(rgba, ct) {
+  const n = rgba.length >>> 2;
+  if (ct === 6) return rgba;
+  const ch = ct === 0 ? 1 : ct === 4 ? 2 : 3;
+  const out = new Uint8Array(n * ch);
+  for (let i = 0, d = 0, s = 0; i < n; i++, d += 4, s += ch) {
+    if (ct === 0) out[s] = rgba[d];
+    else if (ct === 4) {
+      out[s] = rgba[d];
+      out[s + 1] = rgba[d + 3];
+    } else {
+      out[s] = rgba[d];
+      out[s + 1] = rgba[d + 1];
+      out[s + 2] = rgba[d + 2];
+    }
+  }
+  return out;
+}
+
+/**
+ * A palette's entries in the order a trial writes them: the transparent ones first (by alpha), then by `order`:
+ * 'count' (most used first), 'luminance' (dark to light), or 'walk' (a greedy nearest-neighbour walk through RGB
+ * space starting from the most used colour, so colours that sit next to each other in the image get close indices
+ * and filter to small deltas).
+ */
+function paletteOrder(colours, order) {
+  const lum = (c) => 299 * c.rgba[0] + 587 * c.rgba[1] + 114 * c.rgba[2];
+  const transparent = colours.filter((c) => c.rgba[3] !== 255).sort((x, y) => x.rgba[3] - y.rgba[3] || x.word - y.word);
+  const opaque = colours.filter((c) => c.rgba[3] === 255);
+  if (order === 'luminance') opaque.sort((x, y) => lum(x) - lum(y) || x.word - y.word);
+  else if (order === 'walk') {
+    opaque.sort((x, y) => y.count - x.count || x.word - y.word);
+    // Greedy nearest-neighbour walk over the opaque colours.
+    const used = new Uint8Array(opaque.length);
+    const walked = [];
+    let cur = 0;
+    used[0] = 1;
+    walked.push(opaque[0]);
+    for (let k = 1; k < opaque.length; k++) {
+      const c = walked[walked.length - 1].rgba;
+      let best = -1;
+      let bestD = Infinity;
+      for (let j = 0; j < opaque.length; j++) {
+        if (used[j]) continue;
+        const o = opaque[j].rgba;
+        const dr = c[0] - o[0];
+        const dg = c[1] - o[1];
+        const db = c[2] - o[2];
+        const d = dr * dr + dg * dg + db * db;
+        if (d < bestD || (d === bestD && opaque[j].word < opaque[best].word)) {
+          bestD = d;
+          best = j;
+        }
+      }
+      used[best] = 1;
+      walked.push(opaque[best]);
+      cur = best;
+    }
+    void cur;
+    return [...transparent, ...walked];
+  } else opaque.sort((x, y) => y.count - x.count || x.word - y.word);
+  return [...transparent, ...opaque];
+}
+
+/** The palette form: {plte, trns, indices}. */
+function paletteForm(rgba, colours, order) {
+  const entries = paletteOrder(colours, order);
+  const index = new Map(entries.map((c, i) => [c.word, i]));
+  const plte = new Uint8Array(entries.length * 3);
+  let transparent = 0;
+  entries.forEach((c, i) => {
+    plte[i * 3] = c.rgba[0];
+    plte[i * 3 + 1] = c.rgba[1];
+    plte[i * 3 + 2] = c.rgba[2];
+    if (c.rgba[3] !== 255) transparent = i + 1;
+  });
+  const trns = transparent === 0 ? null : Uint8Array.from(entries.slice(0, transparent), (c) => c.rgba[3]);
+  const n = rgba.length >>> 2;
+  const u32 = wordsOf(rgba);
+  const indices = new Uint8Array(n);
+  for (let i = 0; i < n; i++) indices[i] = index.get(u32[i]);
+  return { plte, trns, indices };
+}
+
+/** The zlib setting every choice is screened by. */
+export const SCREEN = Object.freeze({ level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY });
+
+/** The fewest-distinct-pairs heuristic's cost: how many distinct pairs of neighbouring bytes a filtered row holds. */
+function pairsOf(row, seen, stamp) {
+  let n = 0;
+  for (let i = 1; i < row.length; i++) {
+    const pair = (row[i - 1] << 8) | row[i];
+    if (seen[pair] !== stamp) {
+      seen[pair] = stamp;
+      n++;
+    }
+  }
+  return n;
+}
+
+/**
+ * The raw data of an image of `samples` (height rows of width x bpp samples), each row behind its filter byte, by
+ * `choice`: a filter type (0 to 4) for every row, or 'minsum', 'pairs' or 'brute' (per row: the five filters each
+ * compressed by zlib after the 32 KiB written before it, the smallest kept; the lower type on a tie);
+ * written into `raw` when it is given.
+ */
+export function filtered(samples, width, height, bpp, choice, raw = new Uint8Array(height * (width * bpp + 1))) {
+  const stride = width * bpp;
+  const trial = Array.from({ length: 5 }, (_, t) => {
+    const row = new Uint8Array(stride + 1);
+    row[0] = t;
+    return row;
+  });
+  const seen = new Uint32Array(65536);
+  let stamp = 0;
+  for (let y = 0; y < height; y++) {
+    const cur = samples.subarray(y * stride, (y + 1) * stride);
+    const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+    const at = y * (stride + 1);
+    if (typeof choice === 'number') {
+      raw[at] = choice;
+      filterRow(choice, cur, prev, bpp, raw.subarray(at + 1, at + 1 + stride));
+      continue;
+    }
+    const before = raw.subarray(Math.max(0, at - BRUTE_CONTEXT), at);
+    let type = 0;
+    let best = Infinity;
+    for (let t = 0; t < 5; t++) {
+      filterRow(t, cur, prev, bpp, trial[t].subarray(1));
+      let cost;
+      if (choice === 'minsum') cost = signedSum(trial[t].subarray(1));
+      else if (choice === 'pairs') cost = pairsOf(trial[t].subarray(1), seen, ++stamp);
+      else cost = deflateSync(trial[t], before.length === 0 ? { level: BRUTE_LEVEL, memLevel: 9 } : { level: BRUTE_LEVEL, memLevel: 9, dictionary: before }).length;
+      if (cost < best) {
+        best = cost;
+        type = t;
+      }
+    }
+    raw.set(trial[type], at);
+  }
+  return raw;
+}
+
+/** The filter choices each form is screened with. Brute force is tried on the
+ * channel forms only: on palette forms it never wins (filter 0 dominates) and
+ * its five zlib runs a row cost screen time on every palette order. */
+export const FILTERS = Object.freeze({
+  palette: Object.freeze([0, 1, 'minsum', 'pairs']),
+  channels: Object.freeze([0, 1, 2, 4, 'minsum', 'pairs', 'brute']),
+});
+
+/** The forms the reference screens for an image: each {colourType, bpp, samples, plte, trns, filters}. */
+export function formsOf(rgba) {
+  const { opaque, grey, colours } = analyse(rgba);
+  const forms = [];
+  if (colours !== null) {
+    for (const order of ['count', 'luminance', 'walk']) {
+      const p = paletteForm(rgba, colours, order);
+      forms.push({ colourType: 3, bpp: 1, samples: p.indices, plte: p.plte, trns: p.trns, filters: FILTERS.palette, order });
+    }
+    if (!grey) return forms;
+  }
+  const key = opaque ? null : transparentKey(rgba, grey);
+  let ct;
+  let trns = null;
+  if (grey) {
+    ct = opaque || key !== null ? 0 : 4;
+    if (key !== null) trns = Uint8Array.of(0, key);
+  } else {
+    ct = opaque || key !== null ? 2 : 6;
+    if (key !== null) trns = Uint8Array.of(0, key >>> 16, 0, (key >>> 8) & 0xff, 0, key & 0xff);
+  }
+  const bpp = { 0: 1, 2: 3, 4: 2, 6: 4 }[ct];
+  forms.push({ colourType: ct, bpp, samples: samplesOf(rgba, ct), plte: null, trns, filters: FILTERS.channels, order: null });
+  return forms;
+}
+
+/** The bytes a form's PLTE and tRNS chunks take in its file (each 12 bytes of length, type and CRC around its data). */
+export const chunkBytes = (form) => (form.plte === null ? 0 : 12 + form.plte.length) + (form.trns === null ? 0 : 12 + form.trns.length);
+
+/**
+ * Every screened candidate for an image, ranked by its zlib-6 size: each {form, choice, data, bytes} where bytes is
+ * the zlib stream's length plus the form's PLTE/tRNS chunk bytes. The first is the screen's winner; the first on a tie.
+ */
+export function screenAll(rgba, width, height) {
+  const out = [];
+  for (const form of formsOf(rgba)) {
+    const size = height * (width * form.bpp + 1);
+    const chunks = chunkBytes(form);
+    for (const choice of form.filters) {
+      const data = filtered(form.samples, width, height, form.bpp, choice);
+      const zlib = deflateSync(data, SCREEN);
+      out.push({ form, choice, data, bytes: zlib.length + chunks });
+    }
+  }
+  out.sort((a, b) => a.bytes - b.bytes);
+  return out;
+}
+
+/** The screen's winner for an image: its form, filter choice and filtered data, zlib's stream of it at SCREEN. */
+export function screen(rgba, width, height) {
+  return screenAll(rgba, width, height)[0];
+}
+
+/** The PNG of an image of `form` whose IDAT holds the zlib stream `idat`. */
+export function pngOfForm(width, height, form, idat) {
+  const chunks = [['IHDR', ihdrOf(width, height, form.colourType)]];
+  if (form.plte !== null) chunks.push(['PLTE', form.plte]);
+  if (form.trns !== null) chunks.push(['tRNS', form.trns]);
+  chunks.push(['IDAT', idat]);
+  chunks.push(['IEND', new Uint8Array(0)]);
+  return pngOf(chunks);
+}
